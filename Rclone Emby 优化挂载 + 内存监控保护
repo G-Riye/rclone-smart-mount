@@ -1,0 +1,186 @@
+#!/bin/bash
+# Rclone Emby 优化挂载 + 内存监控保护
+# 功能：
+# 1. 正常挂载 alist
+# 2. 自动检测 rclone 内存占用，超过阈值时自动 kill 并重挂
+# 3. 增强错误处理和日志记录
+
+MOUNT_POINT="/mnt/user/clouds/alist"
+CACHE_DIR="/mnt/user/clouds/cache"
+RCLONE_REMOTE="alist:/"
+MEM_THRESHOLD=2048   # 内存阈值 (MB)，超过就重启 rclone
+MAX_RESTART_ATTEMPTS=3
+LOG_FILE="/var/log/rclone_monitor.log"
+
+# 日志函数
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+log_message "===== Rclone Emby 挂载 + 内存保护启动 ====="
+
+# ---------------------------
+# 检查 rclone 内存占用（增强版）
+# ---------------------------
+RCLONE_PID=$(pgrep -f "rclone.*alist")
+if [[ -n "$RCLONE_PID" ]]; then
+    # 获取内存占用（RSS）和内存百分比
+    RCLONE_INFO=$(ps -o pid,rss,pmem,etime,cmd -p "$RCLONE_PID" --no-headers)
+    RCLONE_MEM=$(echo "$RCLONE_INFO" | awk '{print $2}')
+    RCLONE_MEM_MB=$((RCLONE_MEM / 1024))
+    RCLONE_MEM_PERCENT=$(echo "$RCLONE_INFO" | awk '{print $3}')
+    RCLONE_UPTIME=$(echo "$RCLONE_INFO" | awk '{print $4}')
+    
+    log_message "发现运行中的rclone进程: PID=$RCLONE_PID, 内存=${RCLONE_MEM_MB}MB (${RCLONE_MEM_PERCENT}%), 运行时间=$RCLONE_UPTIME"
+    
+    if (( RCLONE_MEM_MB > MEM_THRESHOLD )); then
+        log_message "⚠️ rclone内存超过阈值${MEM_THRESHOLD}MB，准备重启进程"
+        
+        # 记录重启前的状态
+        log_message "重启前进程状态: $(ps -o pid,rss,pmem,etime,cmd -p $RCLONE_PID --no-headers)"
+        
+        # 优雅关闭
+        log_message "尝试优雅关闭rclone进程..."
+        kill -TERM "$RCLONE_PID"
+        sleep 10
+        
+        # 检查是否还在运行
+        if kill -0 "$RCLONE_PID" 2>/dev/null; then
+            log_message "优雅关闭失败，强制终止进程"
+            kill -9 "$RCLONE_PID"
+        fi
+        
+        # 强制卸载
+        log_message "卸载挂载点..."
+        umount -l "$MOUNT_POINT" 2>/dev/null || umount -f "$MOUNT_POINT" 2>/dev/null || true
+        
+        # 等待进程完全退出
+        sleep 5
+        
+        # 清理可能的僵尸进程
+        pkill -f "rclone.*alist" 2>/dev/null || true
+        
+        log_message "rclone进程重启完成，准备重新挂载"
+    else
+        log_message "✅ rclone内存使用正常 (${RCLONE_MEM_MB}MB < ${MEM_THRESHOLD}MB)"
+        
+        # 检查挂载状态
+        if mount | grep -q "$MOUNT_POINT"; then
+            log_message "✅ 挂载正常，监控任务完成"
+            exit 0
+        else
+            log_message "⚠️ 发现rclone进程运行但未挂载，准备重新挂载"
+        fi
+    fi
+else
+    log_message "未发现运行中的rclone进程，准备启动挂载"
+fi
+
+# ---------------------------
+# 确保挂载点存在
+# ---------------------------
+mkdir -p "$MOUNT_POINT"
+mkdir -p "$CACHE_DIR"
+
+# ---------------------------
+# 根据磁盘空间动态设置缓存大小
+# ---------------------------
+available_space=$(df "$CACHE_DIR" | awk 'NR==2 {print $4}')
+available_gb=$((available_space / 1024 / 1024))
+
+if [ $available_gb -gt 500 ]; then
+    cache_size="200G"
+elif [ $available_gb -gt 200 ]; then
+    cache_size="100G"
+elif [ $available_gb -gt 100 ]; then
+    cache_size="50G"
+else
+    cache_size="20G"
+fi
+
+log_message "缓存目录可用空间: ${available_gb}GB，设置缓存大小: $cache_size"
+
+# ---------------------------
+# 检查并清理旧的挂载
+# ---------------------------
+if mount | grep -q "$MOUNT_POINT"; then
+    log_message "发现已存在的挂载，先卸载"
+    umount -l "$MOUNT_POINT" 2>/dev/null || umount -f "$MOUNT_POINT" 2>/dev/null || true
+    sleep 3
+fi
+
+# ---------------------------
+# 启动rclone挂载（优化参数）
+# ---------------------------
+log_message "🔄 开始挂载rclone..."
+
+rclone mount "$RCLONE_REMOTE" "$MOUNT_POINT" \
+    --use-mmap \
+    --gid 100 --uid 99 \
+    --umask 0000 \
+    --default-permissions \
+    --allow-other --allow-non-empty \
+    \
+    --buffer-size 256M \
+    --transfers 8 \
+    --checkers 16 \
+    --low-level-retries 100 \
+    --retries 5 \
+    --timeout 300s \
+    --contimeout 60s \
+    \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size $cache_size \
+    --vfs-cache-max-age 24h \
+    --vfs-read-ahead 512M \
+    --vfs-read-chunk-size 128M \
+    --vfs-read-chunk-size-limit 1G \
+    --vfs-fast-fingerprint \
+    --vfs-cache-poll-interval 60s \
+    \
+    --dir-cache-time 24h \
+    --cache-dir="$CACHE_DIR" \
+    \
+    --no-modtime \
+    --no-checksum \
+    --multi-thread-streams 4 \
+    --multi-thread-cutoff 50M \
+    \
+    --log-level ERROR \
+    --log-file "/var/log/rclone.log" \
+    --daemon
+
+# ---------------------------
+# 验证挂载结果
+# ---------------------------
+sleep 8
+
+# 多次检查挂载状态
+for i in {1..5}; do
+    if mount | grep -q "$MOUNT_POINT"; then
+        NEW_PID=$(pgrep -f "rclone.*alist")
+        log_message "✅ 挂载成功！新的rclone进程PID: $NEW_PID"
+        
+        # 显示新进程的初始状态
+        if [[ -n "$NEW_PID" ]]; then
+            sleep 2
+            NEW_MEM_INFO=$(ps -o pid,rss,pmem -p "$NEW_PID" --no-headers)
+            NEW_MEM_MB=$(echo "$NEW_MEM_INFO" | awk '{print int($2/1024)}')
+            log_message "新进程初始内存占用: ${NEW_MEM_MB}MB"
+        fi
+        
+        log_message "===== 挂载监控完成 ====="
+        exit 0
+    else
+        log_message "挂载检查第${i}次失败，等待重试..."
+        sleep 3
+    fi
+done
+
+log_message "❌ 挂载失败！请检查配置和网络连接"
+log_message "最后的rclone日志:"
+tail -10 /var/log/rclone.log 2>/dev/null | while read line; do
+    log_message "RCLONE: $line"
+done
+
+exit 1
